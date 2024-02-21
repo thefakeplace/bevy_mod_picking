@@ -27,7 +27,6 @@
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use bevy_math::Vec3;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{prelude::*, view::RenderLayers};
 use bevy_transform::prelude::*;
@@ -153,8 +152,8 @@ pub fn update_hits(
                                 let transformed_surface_normal = global_transform.compute_matrix().transform_vector3(surface_normal.into());
                                 let is_backface = ray.direction.normalize_or_zero().dot(transformed_surface_normal) > 0.0;
                                 if is_backface {
-                                    ray_start = hit.point + ray.direction * f32::EPSILON;
-                                    collected_toi += hit.toi;
+                                    ray_start = hit.point + ray.direction * 0.1;
+                                    collected_toi += hit.toi + 0.1;
                                     return None;
                                 }
                             }
