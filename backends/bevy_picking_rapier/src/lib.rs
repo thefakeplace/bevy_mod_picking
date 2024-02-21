@@ -27,13 +27,14 @@
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_math::Vec3;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{prelude::*, view::RenderLayers};
 use bevy_transform::prelude::*;
 use bevy_window::PrimaryWindow;
 
 use bevy_picking_core::backend::prelude::*;
-use bevy_rapier3d::prelude::*;
+use bevy_rapier3d::{na::{Const, OPoint}, prelude::*};
 
 // Re-export for uses who want this
 pub use bevy_rapier3d;
@@ -87,6 +88,7 @@ pub fn update_hits(
     marked_targets: Query<&RapierPickable>,
     layers: Query<&RenderLayers>,
     backend_settings: Res<RapierBackendSettings>,
+    q_colliders: Query<(&Collider, &GlobalTransform)>,
     rapier_context: Option<Res<RapierContext>>,
     mut output_events: EventWriter<PointerHits>,
 ) {
@@ -108,47 +110,68 @@ pub fn update_hits(
             .filter_map(|(entity, camera, transform, _, layers)| {
                 let mut viewport_pos = pointer_location.position;
                 if let Some(viewport) = &camera.viewport {
-                    viewport_pos -= viewport.physical_position.as_vec2();
+                    viewport_pos -= camera.logical_viewport_rect().unwrap().min;
                 }
                 camera
                     .viewport_to_world(transform, viewport_pos)
                     .map(|ray| (entity, camera, ray, layers))
             })
         {
-            if let Some((entity, hit_data)) = rapier_context
-                .cast_ray_and_get_normal(
-                    ray.origin,
-                    ray.direction,
-                    f32::MAX,
-                    true,
-                    QueryFilter::new().predicate(&|entity| {
-                        let marker_requirement =
-                            !backend_settings.require_markers || marked_targets.get(entity).is_ok();
+            // if we hit a backface, start a new trace just in front of the surface we hit
+            // we can do this to skip backfaces when picking
+            let mut ray_start = ray.origin;
+            let mut collected_toi = 0.0;
+            for iteration in 0..2 {
+                if let Some((entity, hit_data)) = rapier_context
+                    .cast_ray_and_get_normal(
+                        ray_start,
+                        ray.direction,
+                        f32::MAX,
+                        true,
+                        QueryFilter::new().predicate(&|entity| {
+                            let marker_requirement =
+                                !backend_settings.require_markers || marked_targets.get(entity).is_ok();
 
-                        // Cameras missing render layers intersect all layers
-                        let cam_layers = cam_layers.copied().unwrap_or(RenderLayers::all());
-                        // Other entities missing render layers are on the default layer 0
-                        let entity_layers = layers.get(entity).copied().unwrap_or_default();
-                        let render_layers_match = cam_layers.intersects(&entity_layers);
+                            // Cameras missing render layers intersect all layers
+                            let cam_layers = cam_layers.copied().unwrap_or(RenderLayers::all());
+                            // Other entities missing render layers are on the default layer 0
+                            let entity_layers = layers.get(entity).copied().unwrap_or_default();
+                            let render_layers_match = cam_layers.intersects(&entity_layers);
 
-                        let pickable = pickables
-                            .get(entity)
-                            .map(|p| *p != Pickable::IGNORE)
-                            .unwrap_or(true);
-                        marker_requirement && render_layers_match && pickable
-                    }),
-                )
-                .map(|(entity, hit)| {
-                    let hit_data =
-                        HitData::new(cam_entity, hit.toi, Some(hit.point), Some(hit.normal));
-                    (entity, hit_data)
-                })
-            {
-                output_events.send(PointerHits::new(
-                    *pointer_id,
-                    vec![(entity, hit_data)],
-                    camera.order as f32,
-                ));
+                            let pickable = pickables
+                                .get(entity)
+                                .map(|p| *p != Pickable::IGNORE)
+                                .unwrap_or(true);
+                            marker_requirement && render_layers_match && pickable
+                        }),
+                    )
+                    .and_then(|(entity, hit)| {
+                        if let Ok((collider, global_transform)) = q_colliders.get(entity) {
+                            let point = OPoint::<f32, Const<3>>::new(hit.point.x, hit.point.y, hit.point.z);
+                            if let Some(surface_normal) = collider.raw.feature_normal_at_point(hit.feature, &point) {
+                                // transform the surface normal back into world space
+                                let transformed_surface_normal = global_transform.compute_matrix().transform_vector3(surface_normal.into());
+                                let is_backface = ray.direction.normalize_or_zero().dot(transformed_surface_normal) > 0.0;
+                                if is_backface {
+                                    ray_start = hit.point + ray.direction * f32::EPSILON;
+                                    collected_toi += hit.toi;
+                                    return None;
+                                }
+                            }
+                        }
+
+                        let hit_data =
+                            HitData::new(cam_entity, collected_toi + hit.toi, Some(hit.point), Some(hit.normal));
+                        Some((entity, hit_data))
+                    })
+                {
+                    output_events.send(PointerHits::new(
+                        *pointer_id,
+                        vec![(entity, hit_data)],
+                        camera.order as f32,
+                    ));
+                    break;
+                }
             }
         }
     }
